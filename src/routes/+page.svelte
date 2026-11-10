@@ -27,8 +27,12 @@
     "+": [KEY.volUp, true],
     "=": [KEY.volUp, true],
     "-": [KEY.volDown, true],
-    m: [KEY.mute, false],
   };
+  /** Letter shortcuts are matched by physical key so they work in any layout. */
+  const KEYBOARD_BY_CODE: Record<string, [number, boolean]> = {
+    KeyM: [KEY.mute, false],
+  };
+  const keyFor = (e: KeyboardEvent) => KEYBOARD[e.key] ?? KEYBOARD_BY_CODE[e.code];
 
   const SAVED_KEY = "adb-remote.saved";
 
@@ -38,6 +42,9 @@
   let saved = $state<string[]>([]);
   let connecting = $state(false);
   let error = $state("");
+  /** adb itself is unavailable; set and cleared by the device poll. */
+  let adbError = $state("");
+  let refreshing = false;
   let text = $state("");
   let showDevices = $state(true);
 
@@ -53,7 +60,8 @@
 
   function loadSaved() {
     try {
-      saved = JSON.parse(localStorage.getItem(SAVED_KEY) ?? "[]");
+      const list: unknown = JSON.parse(localStorage.getItem(SAVED_KEY) ?? "[]");
+      saved = Array.isArray(list) ? list.filter((a) => typeof a === "string") : [];
     } catch {
       saved = [];
     }
@@ -74,13 +82,18 @@
   }
 
   async function refresh() {
+    if (refreshing) return;
+    refreshing = true;
     try {
       devices = await invoke<Device[]>("list_devices");
+      adbError = "";
       if (!devices.some((d) => d.serial === active && d.state === "device")) {
         active = devices.find((d) => d.state === "device")?.serial ?? null;
       }
     } catch (e) {
-      error = String(e);
+      adbError = String(e);
+    } finally {
+      refreshing = false;
     }
   }
 
@@ -96,6 +109,8 @@
       if (devices.some((d) => d.serial === serial && d.state === "device")) {
         active = serial;
         showDevices = false;
+        // Already mirroring another device: switch instead of closing the view.
+        if (mirroring) await stopMirror(true);
         startMirror();
       }
     } catch (e) {
@@ -119,7 +134,6 @@
     if (!active) return;
     try {
       await invoke("send_key", { serial: active, keycode, longpress });
-      error = "";
     } catch (e) {
       error = String(e);
     }
@@ -153,7 +167,6 @@
     try {
       await invoke("send_text", { serial: active, text });
       text = "";
-      error = "";
     } catch (e) {
       error = String(e);
     }
@@ -299,6 +312,9 @@
         maxFps: q.maxFps,
         onData: channel,
       });
+      // Stopped while starting: the backend registered the mirror after our
+      // stop request, so stop it again.
+      if (run !== mirrorRun) await invoke("stop_mirror", { serial }).catch(() => {});
     } catch (e) {
       if (run === mirrorRun) {
         error = String(e);
@@ -331,19 +347,26 @@
     if (mirroring && !mirrorBusy && (!ready || active !== mirrorSerial)) stopMirror();
   });
 
+  /** Touch and scroll events are sent strictly one after another, so a
+   *  release can never overtake its press. */
+  let inputChain: Promise<unknown> = Promise.resolve();
+  function sendInput(cmd: string, args: Record<string, unknown>) {
+    inputChain = inputChain.then(() => invoke(cmd, args)).catch(() => {});
+  }
+
   function touch(e: PointerEvent, action: number) {
     if (!canvas || !mirrorSerial || !hasPicture) return;
     const r = canvas.getBoundingClientRect();
     if (!r.width || !r.height) return;
     const clamp = (v: number, max: number) => Math.max(0, Math.min(max - 1, Math.round(v)));
-    invoke("mirror_touch", {
+    sendInput("mirror_touch", {
       serial: mirrorSerial,
       action,
       x: clamp(((e.clientX - r.left) / r.width) * canvas.width, canvas.width),
       y: clamp(((e.clientY - r.top) / r.height) * canvas.height, canvas.height),
       width: canvas.width,
       height: canvas.height,
-    }).catch(() => {});
+    });
   }
 
   function onScreenDown(e: PointerEvent) {
@@ -368,7 +391,7 @@
     e.preventDefault();
     const r = canvas.getBoundingClientRect();
     const step = (d: number) => Math.max(-4, Math.min(4, -d / 40));
-    invoke("mirror_scroll", {
+    sendInput("mirror_scroll", {
       serial: mirrorSerial,
       x: Math.round(((e.clientX - r.left) / r.width) * canvas.width),
       y: Math.round(((e.clientY - r.top) / r.height) * canvas.height),
@@ -376,7 +399,7 @@
       height: canvas.height,
       dx: step(e.deltaX),
       dy: step(e.deltaY),
-    }).catch(() => {});
+    });
   }
 
   function isTyping(e: KeyboardEvent) {
@@ -386,7 +409,7 @@
 
   function onKeyDown(e: KeyboardEvent) {
     if (isTyping(e) || e.metaKey || e.ctrlKey || e.altKey) return;
-    const map = KEYBOARD[e.key];
+    const map = keyFor(e);
     if (!map) return;
     e.preventDefault();
     if (e.repeat) return;
@@ -394,12 +417,14 @@
   }
 
   function onKeyUp(e: KeyboardEvent) {
-    if (KEYBOARD[e.key]) holdEnd();
+    if (keyFor(e)) holdEnd();
   }
 
   onMount(() => {
     loadSaved();
     loadQuality();
+    // After a page reload the backend may still be streaming to nobody.
+    invoke("stop_all_mirrors").catch(() => {});
     refresh();
     const timer = setInterval(refresh, 3000);
     return () => clearInterval(timer);
@@ -514,6 +539,9 @@
     </section>
   {/if}
 
+  {#if adbError}
+    <div class="error">{adbError}</div>
+  {/if}
   {#if error}
     <button class="error" onclick={() => (error = "")} title="Dismiss">{error}</button>
   {/if}

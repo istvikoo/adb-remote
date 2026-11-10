@@ -59,6 +59,10 @@ npm run tauri build
 - Starting the screen view wakes the device.
 - Windows is planned but not built or tested yet.
 
+## License
+
+MIT, see [LICENSE](LICENSE). The bundled scrcpy server keeps its own license, described below.
+
 ## Third-party software
 
 This repository includes the prebuilt `scrcpy-server` v5.0.1 binary (`src-tauri/resources/scrcpy-server`) from [Genymobile/scrcpy](https://github.com/Genymobile/scrcpy), licensed under the Apache License 2.0. It is pushed to the device at runtime to provide screen mirroring and input injection.

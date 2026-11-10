@@ -7,7 +7,7 @@ use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::net::{Shutdown, TcpStream};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{mpsc, Arc, Mutex};
 use std::time::Duration;
 
 use crate::adb::{self, Result};
@@ -270,10 +270,83 @@ fn drain(mut stream: TcpStream, alive: Arc<AtomicBool>, log: Option<Arc<Mutex<St
     });
 }
 
+/// Останні рядки журналу сервера, щоб повідомлення про помилку лишалось коротким.
+fn log_tail(log: &Mutex<String>) -> String {
+    let text = log.lock().map(|l| l.trim().to_string()).unwrap_or_default();
+    let mut lines: Vec<&str> = text.lines().rev().take(3).collect();
+    lines.reverse();
+    let mut tail = lines.join(" | ");
+    if tail.len() > 400 {
+        let cut = (tail.len() - 400..tail.len())
+            .find(|&i| tail.is_char_boundary(i))
+            .unwrap_or(0);
+        tail.drain(..cut);
+    }
+    tail
+}
+
+fn with_log(msg: &str, log: &Mutex<String>) -> String {
+    let tail = log_tail(log);
+    if tail.is_empty() {
+        msg.to_string()
+    } else {
+        format!("{msg} ({tail})")
+    }
+}
+
+/// Усі з'єднання з сервером, відкриті й перевірені до запуску потоків.
+struct Sockets {
+    video: TcpStream,
+    video_reader: TcpStream,
+    control: TcpStream,
+    control_reader: TcpStream,
+    control_writer: TcpStream,
+}
+
+/// Під'єднується до сокета сервера. При помилці всі відкриті тут з'єднання
+/// закриваються самі (копій у потоках ще немає).
+fn attach(serial: &str, scid: u32, server_alive: &AtomicBool) -> Result<Sockets> {
+    let io = |e: std::io::Error| e.to_string();
+    let socket = format!("localabstract:scrcpy_{scid:08x}");
+
+    // Сервер стартує не миттєво: пробуємо під'єднатися до його сокета.
+    let mut video = None;
+    for _ in 0..100 {
+        if !server_alive.load(Ordering::SeqCst) {
+            break;
+        }
+        if let Ok(s) = adb::open_service(serial, &socket) {
+            video = Some(s);
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    let mut video = video.ok_or("The mirroring server did not start")?;
+
+    let control = adb::open_service(serial, &socket)
+        .map_err(|e| format!("Could not open the control channel ({e})"))?;
+    let _ = control.set_nodelay(true);
+
+    video.set_read_timeout(Some(Duration::from_secs(10))).map_err(io)?;
+    read_video_header(&mut video)?;
+    video.set_read_timeout(None).map_err(io)?;
+
+    Ok(Sockets {
+        video_reader: video.try_clone().map_err(io)?,
+        control_reader: control.try_clone().map_err(io)?,
+        control_writer: control.try_clone().map_err(io)?,
+        video,
+        control,
+    })
+}
+
 pub struct Mirror {
     server: TcpStream,
     video: TcpStream,
     control: TcpStream,
+    /// Черга повідомлень керування: один потік пише їх у сокет по порядку,
+    /// тож відправники ніколи не блокуються на мережі.
+    tx: mpsc::Sender<Vec<u8>>,
     alive: Arc<AtomicBool>,
 }
 
@@ -297,64 +370,41 @@ impl Mirror {
         let server = adb::open_service(serial, &server_command(scid, options))?;
         let server_alive = Arc::new(AtomicBool::new(true));
         let log = Arc::new(Mutex::new(String::new()));
-        drain(
-            server.try_clone().map_err(|e| e.to_string())?,
-            server_alive.clone(),
-            Some(log.clone()),
-        );
+        // Якщо копію зробити не вдалось, `server` закриється при виході.
+        let server_reader = server.try_clone().map_err(|e| e.to_string())?;
+        drain(server_reader, server_alive.clone(), Some(log.clone()));
 
-        let server_log = |prefix: &str| {
-            let l = log.lock().map(|l| l.trim().to_string()).unwrap_or_default();
-            if l.is_empty() {
-                prefix.to_string()
-            } else {
-                format!("{prefix}: {l}")
+        let sockets = match attach(serial, scid, &server_alive) {
+            Ok(s) => s,
+            Err(e) => {
+                // Копію з'єднання тримає потік журналу, тому закриваємо явно:
+                // це завершує сервер на пристрої.
+                let _ = server.shutdown(Shutdown::Both);
+                return Err(with_log(&e, &log));
             }
         };
-
-        // Сервер стартує не миттєво: пробуємо під'єднатися до його сокета.
-        let socket = format!("localabstract:scrcpy_{scid:08x}");
-        let mut video = None;
-        for _ in 0..100 {
-            if !server_alive.load(Ordering::SeqCst) {
-                break;
-            }
-            if let Ok(s) = adb::open_service(serial, &socket) {
-                video = Some(s);
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(100));
-        }
-        let Some(mut video) = video else {
-            let _ = server.shutdown(Shutdown::Both);
-            return Err(server_log("The mirroring server did not start"));
-        };
-        let control = adb::open_service(serial, &socket)
-            .map_err(|e| server_log(&format!("Could not open the control channel ({e})")))?;
-        let _ = control.set_nodelay(true);
-
-        video
-            .set_read_timeout(Some(Duration::from_secs(10)))
-            .map_err(|e| e.to_string())?;
-        if let Err(e) = read_video_header(&mut video) {
-            let _ = server.shutdown(Shutdown::Both);
-            return Err(server_log(&e));
-        }
-        video.set_read_timeout(None).map_err(|e| e.to_string())?;
 
         let alive = Arc::new(AtomicBool::new(true));
 
         // Повідомлення від пристрою (буфер обміну тощо) нам не потрібні,
         // але сокет треба вичитувати.
-        drain(
-            control.try_clone().map_err(|e| e.to_string())?,
-            Arc::new(AtomicBool::new(true)),
-            None,
-        );
+        drain(sockets.control_reader, Arc::new(AtomicBool::new(true)), None);
 
-        let mut reader = video.try_clone().map_err(|e| e.to_string())?;
+        let (tx, rx) = mpsc::channel::<Vec<u8>>();
+        let mut writer = sockets.control_writer;
+        let writer_flag = alive.clone();
+        std::thread::spawn(move || {
+            for msg in rx {
+                if writer.write_all(&msg).is_err() {
+                    writer_flag.store(false, Ordering::SeqCst);
+                    let _ = writer.shutdown(Shutdown::Both);
+                    break;
+                }
+            }
+        });
+
+        let mut reader = sockets.video_reader;
         let flag = alive.clone();
-        let thread_log = log.clone();
         std::thread::spawn(move || {
             let mut framer = Framer::default();
             let reason = loop {
@@ -368,27 +418,31 @@ impl Mirror {
             };
             let stopped_by_us = !flag.swap(false, Ordering::SeqCst);
             if !stopped_by_us && !reason.is_empty() {
-                let l = thread_log.lock().map(|l| l.trim().to_string()).unwrap_or_default();
-                let last = l.lines().last().unwrap_or("");
-                let text = if last.is_empty() { reason } else { format!("{reason} ({last})") };
-                on_message(ended_message(&text));
+                on_message(ended_message(&with_log(&reason, &log)));
             } else {
                 on_message(ended_message(""));
             }
             let _ = reader.shutdown(Shutdown::Both);
         });
 
-        Ok(Mirror { server, video, control, alive })
+        Ok(Mirror {
+            server,
+            video: sockets.video,
+            control: sockets.control,
+            tx,
+            alive,
+        })
     }
 
     pub fn is_alive(&self) -> bool {
         self.alive.load(Ordering::SeqCst)
     }
 
-    pub fn send(&mut self, msg: &[u8]) -> Result<()> {
-        self.control
-            .write_all(msg)
-            .map_err(|e| format!("The control channel was interrupted: {e}"))
+    /// Ставить повідомлення керування в чергу; не блокується.
+    pub fn send(&self, msg: Vec<u8>) -> Result<()> {
+        self.tx
+            .send(msg)
+            .map_err(|_| "The control channel was interrupted".to_string())
     }
 }
 
@@ -418,11 +472,17 @@ impl Mirrors {
         }
     }
 
+    pub fn stop_all(&self) {
+        if let Ok(mut map) = self.0.lock() {
+            map.clear();
+        }
+    }
+
     /// Надсилає повідомлення керування, якщо для пристрою йде трансляція.
     /// `Ok(false)` — трансляції немає, викликач має скористатися shell.
-    pub fn try_send(&self, serial: &str, msgs: &[Vec<u8>]) -> Result<bool> {
+    pub fn try_send(&self, serial: &str, msgs: Vec<Vec<u8>>) -> Result<bool> {
         let mut map = self.0.lock().map_err(|_| "Internal state error")?;
-        let Some(mirror) = map.get_mut(serial) else {
+        let Some(mirror) = map.get(serial) else {
             return Ok(false);
         };
         if !mirror.is_alive() {
@@ -601,9 +661,25 @@ mod tests {
             }
         }
         println!("сесія={session:?} кодек={codec:?} ключових={keys} звичайних={deltas} байт={bytes}");
+        // Канал керування: код 0 (KEYCODE_UNKNOWN) нічого не робить на пристрої.
+        mirror.send(msg_keycode(ACTION_DOWN, 0, 0, 0)).unwrap();
+        mirror.send(msg_keycode(ACTION_UP, 0, 0, 0)).unwrap();
+        std::thread::sleep(Duration::from_millis(500));
         assert!(mirror.is_alive());
         assert!(session.is_some() && codec.is_some() && keys >= 1);
         drop(mirror);
+    }
+
+    #[test]
+    fn keeps_error_log_short() {
+        let empty = Mutex::new(String::new());
+        assert_eq!(with_log("failed", &empty), "failed");
+
+        let log = Mutex::new("line 1\nline 2\nline 3\nline 4\n".to_string());
+        assert_eq!(with_log("failed", &log), "failed (line 2 | line 3 | line 4)");
+
+        let long = Mutex::new("x".repeat(5000));
+        assert!(with_log("failed", &long).len() <= 420);
     }
 
     #[test]

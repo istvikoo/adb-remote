@@ -1,6 +1,6 @@
 {
   "name": "adb-remote",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Desktop remote control for Android TV devices over ADB",
   "type": "module",
   "scripts": {

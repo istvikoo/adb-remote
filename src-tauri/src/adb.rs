@@ -112,6 +112,8 @@ fn open() -> Result<TcpStream> {
         }
     };
     let _ = stream.set_nodelay(true);
+    // Запис не має висіти вічно, якщо зв'язок із пристроєм завис.
+    let _ = stream.set_write_timeout(Some(Duration::from_secs(5)));
     Ok(stream)
 }
 
@@ -307,14 +309,8 @@ struct Session {
 
 impl Session {
     fn open(serial: &str) -> Result<Self> {
-        let mut stream = open()?;
-        stream
-            .set_read_timeout(Some(Duration::from_secs(5)))
-            .map_err(io_err)?;
-        send_request(&mut stream, &format!("host:transport:{serial}"))?;
         // `shell:sh` — сирий (без PTY) інтерпретатор, що читає команди зі stdin.
-        send_request(&mut stream, "shell:sh")?;
-        stream.set_read_timeout(None).map_err(io_err)?;
+        let stream = open_service(serial, "shell:sh")?;
 
         let alive = Arc::new(AtomicBool::new(true));
         let mut reader = stream.try_clone().map_err(io_err)?;
@@ -347,22 +343,28 @@ impl Drop for Session {
     }
 }
 
+/// Сесії за пристроями. Загальний замок береться лише щоб знайти комірку
+/// пристрою, тож завислий пристрій не блокує решту.
 #[derive(Default)]
-pub struct Sessions(Mutex<HashMap<String, Session>>);
+pub struct Sessions(Mutex<HashMap<String, Arc<Mutex<Option<Session>>>>>);
 
 impl Sessions {
     /// Виконує команду в постійній сесії пристрою; при обриві перепідключається один раз.
     pub fn shell(&self, serial: &str, cmd: &str) -> Result<()> {
-        let mut map = self.0.lock().map_err(|_| "Internal state error")?;
+        let slot = {
+            let mut map = self.0.lock().map_err(|_| "Internal state error")?;
+            map.entry(serial.to_string()).or_default().clone()
+        };
+        let mut slot = slot.lock().map_err(|_| "Internal state error")?;
         let mut last_err = String::new();
         for _ in 0..2 {
-            if !map.get(serial).is_some_and(Session::is_alive) {
-                map.insert(serial.to_string(), Session::open(serial)?);
+            if !slot.as_ref().is_some_and(Session::is_alive) {
+                *slot = Some(Session::open(serial)?);
             }
-            match map.get_mut(serial).expect("щойно вставлено").run(cmd) {
+            match slot.as_mut().expect("just set").run(cmd) {
                 Ok(()) => return Ok(()),
                 Err(e) => {
-                    map.remove(serial);
+                    *slot = None;
                     last_err = e;
                 }
             }

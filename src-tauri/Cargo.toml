@@ -1,8 +1,9 @@
 [package]
 name = "adb-remote"
-version = "0.1.0"
+version = "0.1.1"
 description = "Desktop remote control for Android TV devices over ADB"
 authors = ["istvikoo"]
+license = "MIT"
 edition = "2024"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html

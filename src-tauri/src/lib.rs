@@ -38,11 +38,11 @@ fn send_key(
     mirrors: State<'_, Mirrors>,
 ) -> Result<(), String> {
     if !longpress {
-        let msgs = [
+        let msgs = vec![
             scrcpy::msg_keycode(scrcpy::ACTION_DOWN, keycode, 0, 0),
             scrcpy::msg_keycode(scrcpy::ACTION_UP, keycode, 0, 0),
         ];
-        if mirrors.try_send(&serial, &msgs)? {
+        if mirrors.try_send(&serial, msgs)? {
             return Ok(());
         }
     }
@@ -65,7 +65,7 @@ fn send_text(
     } else {
         scrcpy::msg_set_clipboard(0, true, &text)
     };
-    if mirrors.try_send(&serial, &[msg])? {
+    if mirrors.try_send(&serial, vec![msg])? {
         return Ok(());
     }
     sessions.shell(&serial, &adb::text_command(&text)?)
@@ -98,7 +98,16 @@ fn stop_mirror(serial: String, mirrors: State<'_, Mirrors>) {
     mirrors.stop(&serial);
 }
 
+/// Зупиняє всі трансляції. Інтерфейс викликає це при завантаженні, щоб після
+/// перезавантаження сторінки не лишалось трансляцій без глядача.
 #[tauri::command(async)]
+fn stop_all_mirrors(mirrors: State<'_, Mirrors>) {
+    mirrors.stop_all();
+}
+
+// Дотик і прокрутка лише ставлять повідомлення в чергу (без мережі),
+// тому виконуються синхронно, у порядку надходження.
+#[tauri::command]
 fn mirror_touch(
     serial: String,
     action: u8,
@@ -109,11 +118,12 @@ fn mirror_touch(
     mirrors: State<'_, Mirrors>,
 ) -> Result<(), String> {
     mirrors
-        .try_send(&serial, &[scrcpy::finger_touch(action, x, y, width, height)])
+        .try_send(&serial, vec![scrcpy::finger_touch(action, x, y, width, height)])
         .map(|_| ())
 }
 
-#[tauri::command(async)]
+#[tauri::command]
+#[allow(clippy::too_many_arguments)]
 fn mirror_scroll(
     serial: String,
     x: i32,
@@ -125,7 +135,7 @@ fn mirror_scroll(
     mirrors: State<'_, Mirrors>,
 ) -> Result<(), String> {
     mirrors
-        .try_send(&serial, &[scrcpy::msg_scroll(x, y, width, height, dx, dy, 0)])
+        .try_send(&serial, vec![scrcpy::msg_scroll(x, y, width, height, dx, dy, 0)])
         .map(|_| ())
 }
 
@@ -142,6 +152,7 @@ pub fn run() {
             send_text,
             start_mirror,
             stop_mirror,
+            stop_all_mirrors,
             mirror_touch,
             mirror_scroll
         ])
