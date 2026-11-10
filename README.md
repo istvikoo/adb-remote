@@ -12,8 +12,11 @@ Built with Tauri 2 (Rust) and SvelteKit (TypeScript).
 - Text input
 - Live screen view (H.264 via scrcpy, decoded with WebCodecs), with click/drag as touch and mouse wheel as scroll
 - Three screen quality presets (size, bitrate, frame rate)
+- Apps: list installed apps, open or force-stop them, and pin favorites as buttons on the remote
+- ADB console: run shell commands on the device, with history and saved commands (a command is stopped after 15 seconds)
+- Tools: device details (model, Android version, IP, resolution, storage), sleep, wake, reboot, and opening a link on the device
 
-While the screen view is on, key presses go through the scrcpy control channel and are near-instant, and non-Latin text is typed via the device clipboard. With the screen view off, keys are sent with `input keyevent` over a persistent shell, which is slower on weak devices and limited to ASCII text.
+While the screen view is on, key presses go through the scrcpy control channel as real press and release events (so holding a button works like on a hardware remote) and are near-instant, and non-Latin text is typed via the device clipboard. With the screen view off, keys are sent with `input keyevent` over a persistent shell, which is slower on weak devices and limited to ASCII text.
 
 ## Requirements
 

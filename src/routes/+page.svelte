@@ -2,6 +2,9 @@
   import { invoke, Channel } from "@tauri-apps/api/core";
   import { getCurrentWindow, LogicalSize } from "@tauri-apps/api/window";
   import { onMount } from "svelte";
+  import Console from "$lib/Console.svelte";
+  import Apps from "$lib/Apps.svelte";
+  import Tools from "$lib/Tools.svelte";
 
   type Device = { serial: string; state: string; model: string | null };
 
@@ -47,6 +50,67 @@
   let refreshing = false;
   let text = $state("");
   let showDevices = $state(true);
+
+  const TABS = [
+    ["remote", "Remote"],
+    ["apps", "Apps"],
+    ["console", "Console"],
+    ["tools", "Tools"],
+  ] as const;
+  type TabId = (typeof TABS)[number][0];
+  let tab = $state<TabId>("remote");
+  /** Tabs are created on first visit and then kept, so the console output
+   *  and loaded lists survive switching tabs. */
+  let visited = $state({ apps: false, console: false, tools: false });
+
+  function openTab(id: TabId) {
+    tab = id;
+    if (id !== "remote") visited[id] = true;
+  }
+
+  // ---------- favorite apps (buttons on the remote) ----------
+
+  const FAV_KEY = "adb-remote.favApps";
+  let favorites = $state<string[]>([]);
+
+  function loadFavorites() {
+    try {
+      const list: unknown = JSON.parse(localStorage.getItem(FAV_KEY) ?? "[]");
+      favorites = Array.isArray(list) ? list.filter((a) => typeof a === "string") : [];
+    } catch {
+      favorites = [];
+    }
+  }
+
+  function toggleFavorite(pkg: string) {
+    favorites = favorites.includes(pkg) ? favorites.filter((f) => f !== pkg) : [...favorites, pkg];
+    try {
+      localStorage.setItem(FAV_KEY, JSON.stringify(favorites));
+    } catch {}
+  }
+
+  const GENERIC_PARTS = new Set([
+    "tv", "app", "apps", "android", "androidtv", "atv", "player", "launcher", "leanback",
+    "beta", "stable", "free", "pro", "mobile", "client", "main",
+  ]);
+
+  /** Short button label from a package name: its last meaningful part. */
+  function appLabel(pkg: string) {
+    const parts = pkg.split(".");
+    for (let i = parts.length - 1; i > 0; i--) {
+      if (!GENERIC_PARTS.has(parts[i].toLowerCase())) return parts[i];
+    }
+    return parts[parts.length - 1];
+  }
+
+  async function launchFavorite(pkg: string) {
+    if (!active) return;
+    try {
+      await invoke("launch_app", { serial: active, package: pkg });
+    } catch (e) {
+      error = String(e);
+    }
+  }
 
   const activeDevice = $derived(devices.find((d) => d.serial === active && d.state === "device"));
   const ready = $derived(!!activeDevice);
@@ -144,9 +208,34 @@
 
   /** Press with repeat while held. The next command is sent only after the
    *  previous one finishes, so no queue builds up. */
+  /** Key currently held down through the scrcpy control channel. */
+  let heldKey: { serial: string; keycode: number } | null = null;
+
+  function releaseHeld() {
+    if (!heldKey) return;
+    sendInput("key_event", { serial: heldKey.serial, keycode: heldKey.keycode, action: 1, repeat: 0 });
+    heldKey = null;
+  }
+
   function holdStart(keycode: number, repeat: boolean) {
     if (!ready) return;
+    releaseHeld();
     const token = ++holdToken;
+    if (mirroring && hasPicture && mirrorSerial && mirrorSerial === active) {
+      // Screen view is on: send a real key-down now and key-up on release, with
+      // repeat events in between like a hardware remote, so long presses work.
+      const serial = mirrorSerial;
+      heldKey = { serial, keycode };
+      sendInput("key_event", { serial, keycode, action: 0, repeat: 0 });
+      (async () => {
+        await sleep(400);
+        for (let n = 1; token === holdToken; n++) {
+          sendInput("key_event", { serial, keycode, action: 0, repeat: n });
+          await sleep(50);
+        }
+      })();
+      return;
+    }
     (async () => {
       await press(keycode);
       if (!repeat) return;
@@ -160,6 +249,7 @@
 
   function holdEnd() {
     holdToken++;
+    releaseHeld();
   }
 
   async function sendText() {
@@ -331,6 +421,7 @@
     mirroring = false;
     hasPicture = false;
     pointerDown = false;
+    heldKey = null;
     closeDecoder();
     const serial = mirrorSerial;
     mirrorSerial = null;
@@ -423,6 +514,7 @@
   onMount(() => {
     loadSaved();
     loadQuality();
+    loadFavorites();
     // After a page reload the backend may still be streaming to nobody.
     invoke("stop_all_mirrors").catch(() => {});
     refresh();
@@ -546,6 +638,13 @@
     <button class="error" onclick={() => (error = "")} title="Dismiss">{error}</button>
   {/if}
 
+  <nav class="tabs">
+    {#each TABS as [id, label] (id)}
+      <button class:on={tab === id} onclick={() => openTab(id)}>{label}</button>
+    {/each}
+  </nav>
+
+  {#if tab === "remote"}
   <section class="remote" class:off={!ready}>
     <div class="dpad">
       {@render key("▲", KEY.up, { repeat: true, cls: "up", title: "Up" })}
@@ -575,6 +674,14 @@
       {@render key("⏭︎", KEY.next, { title: "Next" })}
     </div>
 
+    {#if favorites.length}
+      <div class="favs">
+        {#each favorites as pkg (pkg)}
+          <button disabled={!ready} title={pkg} onclick={() => launchFavorite(pkg)}>{appLabel(pkg)}</button>
+        {/each}
+      </div>
+    {/if}
+
     <form
       class="text"
       onsubmit={(e) => {
@@ -592,7 +699,23 @@
     </div>
   </section>
 
-  <footer>Keyboard: arrows · Enter = OK · Esc = back · Space = pause · +/− volume</footer>
+  <footer>Keyboard: arrows · Enter = OK · Esc = back · Space = pause · +/− volume · M = mute</footer>
+  {/if}
+  {#if visited.apps}
+    <div class="pane" class:gone={tab !== "apps"}>
+      <Apps serial={active} {ready} {favorites} onToggleFavorite={toggleFavorite} />
+    </div>
+  {/if}
+  {#if visited.console}
+    <div class="pane" class:gone={tab !== "console"}>
+      <Console serial={active} {ready} />
+    </div>
+  {/if}
+  {#if visited.tools}
+    <div class="pane" class:gone={tab !== "tools"}>
+      <Tools serial={active} {ready} onKey={(code) => press(code)} />
+    </div>
+  {/if}
 </main>
 </div>
 
@@ -923,6 +1046,53 @@
     font-size: 17px;
   }
 
+  .tabs {
+    display: grid;
+    grid-template-columns: repeat(4, 1fr);
+    gap: 4px;
+    background: #16181c;
+    border-radius: 12px;
+    padding: 4px;
+  }
+  .tabs button {
+    border-radius: 9px;
+    padding: 7px 0;
+    font-size: 13px;
+    font-weight: 600;
+    opacity: 0.6;
+  }
+  .tabs button.on {
+    background: #2b2f38;
+    opacity: 1;
+  }
+  .pane {
+    flex: 1;
+    min-height: 0;
+    display: flex;
+    flex-direction: column;
+  }
+  .pane.gone {
+    display: none;
+  }
+  .favs {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+  }
+  .favs button {
+    background: #23262d;
+    border-radius: 10px;
+    padding: 8px 12px;
+    font-size: 13px;
+    font-weight: 600;
+    max-width: 100%;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .favs button:not(:disabled):hover {
+    background: #2b2f38;
+  }
   footer {
     margin-top: auto;
     font-size: 11px;

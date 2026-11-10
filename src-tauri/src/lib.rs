@@ -1,10 +1,18 @@
 mod adb;
 mod scrcpy;
+mod tools;
 
 use adb::{Device, Sessions};
 use scrcpy::{Mirror, MirrorOptions, Mirrors};
 use tauri::ipc::{Channel, InvokeResponseBody};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 use tauri::State;
+
+/// Прапорець зупинки команди, що зараз виконується в консолі.
+#[derive(Default)]
+struct ConsoleCancel(Mutex<Arc<AtomicBool>>);
 
 #[tauri::command(async)]
 fn list_devices() -> Result<Vec<Device>, String> {
@@ -139,11 +147,86 @@ fn mirror_scroll(
         .map(|_| ())
 }
 
+/// Натискання або відпускання клавіші через канал scrcpy (для справжнього
+/// утримання). Повертає false, якщо трансляції немає.
+#[tauri::command]
+fn key_event(
+    serial: String,
+    keycode: u32,
+    action: u8,
+    repeat: u32,
+    mirrors: State<'_, Mirrors>,
+) -> Result<bool, String> {
+    let action = if action == 0 { scrcpy::ACTION_DOWN } else { scrcpy::ACTION_UP };
+    mirrors.try_send(&serial, vec![scrcpy::msg_keycode(action, keycode, repeat, 0)])
+}
+
+// ---------- консоль ----------
+
+#[tauri::command(async)]
+fn run_shell(
+    serial: String,
+    command: String,
+    cancel: State<'_, ConsoleCancel>,
+) -> Result<adb::ExecResult, String> {
+    let flag = Arc::new(AtomicBool::new(false));
+    if let Ok(mut current) = cancel.0.lock() {
+        *current = flag.clone();
+    }
+    adb::shell_output(&serial, command.trim(), Duration::from_secs(15), &flag)
+}
+
+#[tauri::command]
+fn cancel_shell(cancel: State<'_, ConsoleCancel>) {
+    if let Ok(current) = cancel.0.lock() {
+        current.store(true, Ordering::SeqCst);
+    }
+}
+
+// ---------- застосунки та швидкі дії ----------
+
+#[tauri::command(async)]
+fn list_apps(serial: String, all: bool) -> Result<Vec<String>, String> {
+    tools::list_apps(&serial, all)
+}
+
+#[tauri::command(async)]
+fn launch_app(serial: String, package: String) -> Result<(), String> {
+    tools::launch_app(&serial, &package)
+}
+
+#[tauri::command(async)]
+fn stop_app(serial: String, package: String) -> Result<(), String> {
+    tools::stop_app(&serial, &package)
+}
+
+#[tauri::command(async)]
+fn device_info(serial: String) -> Result<tools::DeviceInfo, String> {
+    tools::device_info(&serial)
+}
+
+#[tauri::command(async)]
+fn open_url(serial: String, url: String) -> Result<(), String> {
+    tools::open_url(&serial, &url)
+}
+
+#[tauri::command(async)]
+fn reboot_device(
+    serial: String,
+    sessions: State<'_, Sessions>,
+    mirrors: State<'_, Mirrors>,
+) -> Result<(), String> {
+    mirrors.stop(&serial);
+    sessions.close(&serial);
+    tools::reboot(&serial)
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
         .manage(Sessions::default())
         .manage(Mirrors::default())
+        .manage(ConsoleCancel::default())
         .invoke_handler(tauri::generate_handler![
             list_devices,
             connect,
@@ -154,7 +237,16 @@ pub fn run() {
             stop_mirror,
             stop_all_mirrors,
             mirror_touch,
-            mirror_scroll
+            mirror_scroll,
+            key_event,
+            run_shell,
+            cancel_shell,
+            list_apps,
+            launch_app,
+            stop_app,
+            device_info,
+            open_url,
+            reboot_device
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

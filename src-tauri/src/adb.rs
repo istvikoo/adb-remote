@@ -134,6 +134,10 @@ fn read_prefixed(s: &mut TcpStream) -> Result<String> {
 }
 
 fn send_request(s: &mut TcpStream, payload: &str) -> Result<()> {
+    // Довжина передається чотирма шістнадцятковими цифрами.
+    if payload.len() > 0xffff {
+        return Err("The command is too long".into());
+    }
     s.write_all(format!("{:04x}{payload}", payload.len()).as_bytes())
         .map_err(io_err)?;
     let mut status = [0u8; 4];
@@ -300,6 +304,69 @@ pub fn push(serial: &str, data: &[u8], remote_path: &str) -> Result<()> {
     }
 }
 
+// ---------- разові команди з виводом ----------
+
+#[derive(Debug, Serialize, PartialEq)]
+pub struct ExecResult {
+    pub output: String,
+    /// Чому вивід неповний: зупинено, тайм-аут або обрізано.
+    pub note: Option<String>,
+}
+
+const MAX_OUTPUT: usize = 256 * 1024;
+
+/// Виконує shell-команду й повертає її вивід (stdout разом зі stderr).
+/// Зупиняється за тайм-аутом, за прапорцем `cancel` або коли виводу забагато;
+/// закриття з'єднання завершує команду на пристрої.
+pub fn shell_output(
+    serial: &str,
+    cmd: &str,
+    timeout: Duration,
+    cancel: &AtomicBool,
+) -> Result<ExecResult> {
+    if cmd.trim().is_empty() {
+        return Err("Enter a command".into());
+    }
+    let mut stream = open_service(serial, &format!("shell:{cmd}"))?;
+    stream
+        .set_read_timeout(Some(Duration::from_millis(200)))
+        .map_err(io_err)?;
+
+    let deadline = std::time::Instant::now() + timeout;
+    let mut out = Vec::new();
+    let mut buf = [0u8; 8192];
+    let note = loop {
+        if cancel.load(Ordering::SeqCst) {
+            break Some("stopped".to_string());
+        }
+        if std::time::Instant::now() >= deadline {
+            break Some(format!("timed out after {} s", timeout.as_secs()));
+        }
+        match stream.read(&mut buf) {
+            Ok(0) => break None,
+            Ok(n) => {
+                out.extend_from_slice(&buf[..n]);
+                if out.len() > MAX_OUTPUT {
+                    out.truncate(MAX_OUTPUT);
+                    break Some("output truncated".to_string());
+                }
+            }
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) => {}
+            Err(e) => return Err(io_err(e)),
+        }
+    };
+    let _ = stream.shutdown(std::net::Shutdown::Both);
+
+    Ok(ExecResult {
+        output: String::from_utf8_lossy(&out).replace("\r\n", "\n"),
+        note,
+    })
+}
+
 // ---------- постійні shell-сесії ----------
 
 struct Session {
@@ -423,6 +490,42 @@ mod tests {
     fn builds_key_commands() {
         assert_eq!(key_command(23, false), "input keyevent 23");
         assert_eq!(key_command(26, true), "input keyevent --longpress 26");
+    }
+
+    #[test]
+    fn rejects_bad_commands() {
+        let never = AtomicBool::new(false);
+        assert!(shell_output("x", "  ", Duration::from_secs(1), &never).is_err());
+    }
+
+    /// Справжній пристрій: `ADB_REMOTE_TEST_SERIAL=ip:5555 cargo test -- --ignored live_shell --nocapture`.
+    #[test]
+    #[ignore]
+    fn live_shell() {
+        let serial = std::env::var("ADB_REMOTE_TEST_SERIAL").expect("ADB_REMOTE_TEST_SERIAL");
+        let never = AtomicBool::new(false);
+
+        let r = shell_output(&serial, "echo hello; echo err 1>&2", Duration::from_secs(5), &never).unwrap();
+        assert_eq!(r.output, "hello\nerr\n");
+        assert_eq!(r.note, None);
+
+        let started = std::time::Instant::now();
+        let r = shell_output(&serial, "echo start; sleep 30", Duration::from_secs(1), &never).unwrap();
+        assert_eq!(r.output, "start\n");
+        assert_eq!(r.note.as_deref(), Some("timed out after 1 s"));
+        assert!(started.elapsed() < Duration::from_secs(3));
+
+        let cancelled = AtomicBool::new(true);
+        let r = shell_output(&serial, "sleep 30", Duration::from_secs(5), &cancelled).unwrap();
+        assert_eq!(r.note.as_deref(), Some("stopped"));
+
+        let info = crate::tools::device_info(&serial).unwrap();
+        println!("{info:?}");
+        assert!(!info.model.is_empty() && !info.android.is_empty());
+        let apps = crate::tools::list_apps(&serial, false).unwrap();
+        let all = crate::tools::list_apps(&serial, true).unwrap();
+        println!("apps: {} third-party, {} total; first: {:?}", apps.len(), all.len(), apps.first());
+        assert!(all.len() >= apps.len() && !all.is_empty());
     }
 
     /// Потребує встановленого adb: `cargo test -- --ignored`.

@@ -1,6 +1,6 @@
 [package]
 name = "adb-remote"
-version = "0.1.1"
+version = "0.2.0"
 description = "Desktop remote control for Android TV devices over ADB"
 authors = ["istvikoo"]
 license = "MIT"
