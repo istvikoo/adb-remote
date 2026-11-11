@@ -20,8 +20,8 @@ While the screen view is on, key presses go through the scrcpy control channel a
 
 ## Requirements
 
-- macOS 13.3 or later (Apple Silicon or Intel)
-- `adb` installed on the computer, for example `brew install android-platform-tools`
+- macOS 13.3 or later (Apple Silicon or Intel), or Windows 10/11 (x64)
+- On macOS: `adb` installed on the computer, for example `brew install android-platform-tools`. The Windows installer includes `adb`.
 - On the device: Developer options → network (ADB) debugging enabled. Confirm the "Allow debugging" prompt on first connection.
 
 Pairing-code wireless debugging (Android 11+ phones) is not supported yet; the device must accept classic ADB connections on a TCP port.
@@ -36,11 +36,11 @@ The app is not signed with an Apple Developer ID, so macOS will refuse to open i
 xattr -dr com.apple.quarantine "/Applications/ADB Remote.app"
 ```
 
-## Install (Windows, preview)
+## Install (Windows)
 
 Download the `-setup.exe` installer from the [Releases](https://github.com/istvikoo/adb-remote/releases) page. `adb` is included, nothing else needs to be installed.
 
-The installer is not code-signed, so Windows SmartScreen shows a warning: choose "More info", then "Run anyway". The Windows build is a preview and has had little testing.
+The installer is not code-signed, so Windows SmartScreen shows a warning: choose "More info", then "Run anyway".
 
 ## Development
 
@@ -66,7 +66,7 @@ npm run tauri build
 
 - DRM-protected apps (Netflix and similar) show a black picture in the screen view. This is an Android restriction.
 - Starting the screen view wakes the device.
-- The Windows build is a preview.
+- Several copies of the app can be open at the same time on Windows; close extra windows to avoid sending keys twice.
 
 ## License
 
