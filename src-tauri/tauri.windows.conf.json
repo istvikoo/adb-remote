@@ -1,0 +1,12 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "bundle": {
+    "resources": {
+      "platform-tools/adb.exe": "platform-tools/adb.exe",
+      "platform-tools/AdbWinApi.dll": "platform-tools/AdbWinApi.dll",
+      "platform-tools/AdbWinUsbApi.dll": "platform-tools/AdbWinUsbApi.dll",
+      "platform-tools/libwinpthread-1.dll": "platform-tools/libwinpthread-1.dll",
+      "platform-tools/NOTICE.txt": "platform-tools/NOTICE.txt"
+    }
+  }
+}

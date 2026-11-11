@@ -1,0 +1,68 @@
+name: Windows build
+
+# Builds the Windows installer and attaches it to an existing GitHub release.
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to attach the installer to (e.g. v0.2.0)"
+        required: true
+
+permissions:
+  contents: write
+
+env:
+  # Android SDK Platform-Tools for Windows, pinned by version and checksum.
+  PLATFORM_TOOLS_URL: https://dl.google.com/android/repository/platform-tools_r37.0.1-win.zip
+  PLATFORM_TOOLS_SHA256: 45f4d63113e895ebde0c90f194099a4676b6ac653bd28d54314a9e022bbc1a99
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+
+      - name: Fetch adb for Windows
+        shell: pwsh
+        run: |
+          Invoke-WebRequest -Uri $env:PLATFORM_TOOLS_URL -OutFile platform-tools.zip
+          $hash = (Get-FileHash platform-tools.zip -Algorithm SHA256).Hash.ToLower()
+          if ($hash -ne $env:PLATFORM_TOOLS_SHA256) { throw "platform-tools checksum mismatch: $hash" }
+          Expand-Archive platform-tools.zip -DestinationPath extracted
+          New-Item -ItemType Directory -Force src-tauri/platform-tools | Out-Null
+          foreach ($f in "adb.exe", "AdbWinApi.dll", "AdbWinUsbApi.dll", "libwinpthread-1.dll", "NOTICE.txt") {
+            Copy-Item "extracted/platform-tools/$f" "src-tauri/platform-tools/$f"
+          }
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Check and test
+        run: |
+          npm run check
+          cargo test --manifest-path src-tauri/Cargo.toml
+
+      - name: Build installer
+        run: npm run tauri build -- --bundles nsis
+
+      - name: Upload to release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $exe = Get-ChildItem src-tauri/target/release/bundle/nsis/*-setup.exe | Select-Object -First 1
+          $name = $exe.Name -replace ' ', '-'
+          Copy-Item $exe.FullName $name
+          (Get-FileHash $name -Algorithm SHA256).Hash.ToLower()
+          gh release upload "${{ inputs.tag }}" $name --clobber --repo "${{ github.repository }}"

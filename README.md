@@ -36,6 +36,12 @@ The app is not signed with an Apple Developer ID, so macOS will refuse to open i
 xattr -dr com.apple.quarantine "/Applications/ADB Remote.app"
 ```
 
+## Install (Windows, preview)
+
+Download the `-setup.exe` installer from the [Releases](https://github.com/istvikoo/adb-remote/releases) page. `adb` is included, nothing else needs to be installed.
+
+The installer is not code-signed, so Windows SmartScreen shows a warning: choose "More info", then "Run anyway". The Windows build is a preview and has had little testing.
+
 ## Development
 
 ```bash
@@ -60,7 +66,7 @@ npm run tauri build
 
 - DRM-protected apps (Netflix and similar) show a black picture in the screen view. This is an Android restriction.
 - Starting the screen view wakes the device.
-- Windows is planned but not built or tested yet.
+- The Windows build is a preview.
 
 ## License
 
@@ -69,3 +75,5 @@ MIT, see [LICENSE](LICENSE). The bundled scrcpy server keeps its own license, de
 ## Third-party software
 
 This repository includes the prebuilt `scrcpy-server` v5.0.1 binary (`src-tauri/resources/scrcpy-server`) from [Genymobile/scrcpy](https://github.com/Genymobile/scrcpy), licensed under the Apache License 2.0. It is pushed to the device at runtime to provide screen mirroring and input injection.
+
+The Windows installer additionally includes `adb.exe` and its libraries from the Android SDK Platform-Tools by Google, downloaded unmodified at build time; their notices are installed alongside as `platform-tools/NOTICE.txt`.
